@@ -1,0 +1,238 @@
+#!/bin/sh
+if [ "$1" == "" ]; then
+cat <<_EOF_
+-------------------------------------------------------
+ Post-Migration cleanup script 1.0
+ Written by Sherin Shamsu on 5/2/2023
+
+ Use: sudo /app/bin/postmig.sh username
+-------------------------------------------------------
+_EOF_
+
+  exit 1
+        else
+username=$(echo $1| tr '[:upper:]' '[:lower:]')
+scriptuser=$(logname)
+
+#Adding some colors
+red=`tput setaf 1`
+green=`tput setaf 2`
+yellow=`tput setaf 3`
+blue=`tput setaf 4`
+reset=`tput sgr0`
+
+# PATH TO YOUR HOSTS FILE
+hosts_file=/etc/hosts
+
+removehost() {
+    if [ -n "$(grep $1 $hosts_file)" ]
+    then
+        sed -i "/ $1/d" $hosts_file
+    fi
+}
+
+addhost() {
+    domain=$1
+    hosts_line="$2 $domain www.$domain"
+    if [ -n "$(grep " $domain" $hosts_file)" ]
+        then
+            sed -i "/ $domain/d" $hosts_file
+            echo "$hosts_line" >> $hosts_file
+        else
+            echo "$hosts_line" >> $hosts_file
+    fi
+}
+
+curl_check() {
+  curl=$(curl -o /dev/null -L -s -w "%{http_code}\n" $1)
+    if [ "$curl" -eq "200" ]
+    then
+        echo "$1 "$green"HTTP Status: $curl $reset"
+    else
+        echo "$1 "$red"HTTP Status: $curl $reset"
+    fi
+}
+
+#---------------------------The Magic --------------------------------
+echo ""$yellow"STAGE #1 ----- Fix Perms $reset"
+for subacct in `grep "^$username:\|: $username$" /etc/trueuserowners | cut -d: -f1`; do
+    echo ""
+    echo "-------> Working on $subacct"
+
+    # Fix Mail Perms
+    echo "Fixing Mail Permissions"
+    /scripts/mailperm $subacct
+
+    # Fix File Persmissions
+    echo "Fixing File Permissions"
+    find /home/$subacct/public_html -type f -exec chmod 644 {} \;
+    find /home/$subacct/public_html -type d -exec chmod 755 {} \;
+    find /home/$subacct/public_html -type f -name "*.cgi" -exec chmod 755 {} \;
+    find /home/$subacct/public_html -type f -name "*.pl" -exec chmod 755 {} \;
+
+    chmod 750 /home/$subacct/public_html
+    chown $subacct.nobody /home/$subacct/public_html
+
+    # Fix PHP Junk
+    echo "Removing PHP Customizations"
+    # Change Internal Field Seperator and then change it back when done, for handling spaces in files/dirs
+    # Thanks for reporting this, Joel!
+
+    #SAVEIFS=IFS
+    IFS=$(echo -en "\n\b")
+    for x in $(find /home/$subacct/ -name .htaccess); do
+        sed -i '/^\s*AddHandler application\/x-httpd/Is/^/#DisabledbyA2Migrations-/g' "$x"
+
+        sed -i '/^\s*AddType\/x-httpd/Is/^/#DisabledbyA2Migrations-/g' "$x"
+    done
+
+    for y in $(find /home/$subacct/ -name .htaccess); do
+        sed -i '/^\s*suPHP_ConfigPath/Is/^/#DisabledbyA2Migrations-/g' "$y";
+    done
+
+    find /home/$subacct/ -type f -name php.ini -execdir mv php.ini php.ini.bak \;
+    #IFS=$SAVEIFS
+    # The line below should reset IFS to default. Trying to save/restore the previous state wasn't working and breaking the rest of this script
+    # https://unix.stackexchange.com/questions/26784/understanding-ifs
+    IFS=$' \t\n'
+
+    #Slack Notification
+    curl -X POST --data-urlencode "payload={\"channel\": \"#migrationsbot\", \"username\": \"MigrationBot\", \"text\": \"Post Migration (new) completed by $scriptuser: $HOSTNAME for $subacct\"}" https://hooks.slack.com/services/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
+
+    echo ""
+done
+
+echo ""
+#look up for SiteGround MX records
+echo ""$yellow"STAGE #2 ----- Look up for SiteGround MX records $reset"
+for subacct in `grep "^$username:\|: $username$" /etc/trueuserowners | cut -d: -f1`; do
+
+    domains=$(grep $subacct /etc/userdomains | cut -d: -f1)
+    zonepath=/var/named
+
+    if [ ! -d "/home/$scriptuser/dns_backup" ]
+    then
+      echo "Creating DNS Backup Directory at /home/$scriptuser/dns_backup "
+      mkdir /home/$scriptuser/dns_backup
+    fi
+
+    tempdir=/home/$scriptuser/dns_backup
+
+    for domain in $domains; do
+
+        for i in `find $zonepath/$domain.db -exec grep -l -m1 "mailspamprotection" {} \; 2>/dev/null` ; do
+            dnsfile=$zonepath/$domain.db && echo "$red SiteGround MX found in DNS zone $dnsfile $reset"
+            cp $dnsfile $tempdir/$domain.db.postmig.bak
+            sed -i '/mx30.mailspamprotection.com/d' $dnsfile
+            sed -i '/mx20.mailspamprotection.com/d' $dnsfile
+            sed -i "s/mx10.mailspamprotection.com/$domain/g" $dnsfile && echo "DNS file updated $dnsfile"
+            sed -i "/^$domain\b$/d" /etc/remotedomains && echo "Removed $domain from remotedomains"
+
+            grep -q "$domain" /etc/localdomains && echo "Domain $domain already present in localdomains" || (echo "$domain" >> /etc/localdomains && echo "Added $domain to localdomains")
+            echo "=========================================================="
+        done
+    done
+done
+echo ""
+
+#Testing websites on local server using /etc/hosts file
+#echo "Backing up $hosts_file to $hosts_file.$username"
+cp $hosts_file $hosts_file.$username
+
+echo ""$yellow"STAGE #3 ----- Testing websites with CURL $reset"
+for subacct in `grep "^$username:\|: $username$" /etc/trueuserowners | cut -d: -f1`; do
+
+    echo "------->  Testing domains for $subacct"
+    hostip=$(grep IP /var/cpanel/users/$subacct | cut -d= -f2)
+    domains=$(grep $subacct /etc/userdomains | cut -d: -f1)
+
+    for domain in $domains; do
+        #Add domain to /etc/hosts file
+        addhost $domain $hostip
+
+        #Test it with CURL
+        curl_check $domain
+
+        #Remove domain from /etc/hosts file
+        removehost $domain
+    done
+    echo ""
+done
+
+#Checking hosts files. If new hosts file identical to the old one, the old one is removed.
+if [ -n "$(cmp -s $hosts_file $hosts_file.test)" ]
+then
+    echo "### HOSTS Files Are DIFFERENT! Something went wrong with one of them. Please check both files $hosts_file AND $hosts_file.$username ###"
+else
+    rm $hosts_file.$username
+fi
+
+echo ""
+#Checking account resources
+echo ""$yellow"STAGE #4 ----- Checking resources $reset"
+for subacct in `grep "^$username:\|: $username$" /etc/trueuserowners | cut -d: -f1`; do
+
+    #Checking Inodes
+    inodes=$(find /home/$subacct | wc -l)
+    echo "------->  Checking resources for $subacct"
+    if [ "$inodes" -gt 599999 ]
+    then
+        echo "Inodes: "$red"$inodes !!!!!! Critical for Shared or Reseller account $reset"
+    else
+        echo "Inodes: "$green"$inodes $reset"
+    fi
+
+    #Checking PHP ver
+    if grep -q CloudLinux /etc/redhat-release 2>/dev/null;
+    then
+        php_v=$(selectorctl -c -u $subacct | awk '{print $1}')
+        echo "PHP version: $php_v"
+    fi
+
+    if grep -q "CentOS Linux" /etc/centos-release 2>/dev/null;
+    then
+        echo "PHP versions per vhost"
+        uapi --user=$subacct LangPHP php_get_vhost_versions | grep -A1 "version: ea"
+    fi
+    echo ""
+done
+
+echo ""
+# Generate hosts file entries and run hackscan in additional loops through all the users so results are consolidated
+echo ""$yellow"STAGE #5 ----- Hosts file Entries for you: $reset"
+
+for subacct in `grep "^$username:\|: $username$" /etc/trueuserowners | cut -d: -f1`; do
+    hostip=$(grep IP /var/cpanel/users/$subacct | cut -d= -f2)
+    domains=$(grep $subacct /etc/userdomains | cut -d: -f1 | awk '{ print length(), $0 | "sort -n" }' | awk '{print $2}')
+    for domain in $domains; do
+        echo $hostip $domain www.$domain
+    done
+done
+
+echo ""
+echo ""$yellow"STAGE #6 ----- Running Hackscan... $reset"
+for subacct in `grep "^$username:\|: $username$" /etc/trueuserowners | cut -d: -f1`; do
+    tmp=/tmp/hackscantemp
+    sudo /app/bin/hackscan.sh /home/$subacct | sed -r "s/\x1B\[([0-9]{1,2}(;[0-9]{1,2})?)?[mGK]//g" > $tmp;
+    if grep -q 'FOUND' $tmp
+    then
+        curl -X POST https://sa.a2hosting.com/app/incoming/hackscan.php \
+-A "yN0yg92lkHiNWbDt8S6YomGRXvXOOuDcDRoiUsofkLuyOXHRPJpYJPSnmOm6lvxH7z9e5v4sRLgUB5jIqr3nzDmUUe1kc3tvNPFXjTgFqPUEleabulohQmTd8CIKS" \
+-H 'Content-Type: text/json; charset=utf-8' \
+-d @- << EOF
+{
+    "server": "${HOSTNAME}",
+    "account": "${subacct}",
+    "agent": "${scriptuser}",
+    "results": "$(cat ${tmp})"
+}
+EOF
+   cat $tmp
+   echo "Hackscan Results found for $subacct.  Reported to Service Assurance Team"
+    fi
+    rm -f $tmp
+done
+
+fi
+
+#--------------------------/The Magic --------------------------------
